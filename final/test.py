@@ -4,10 +4,18 @@ import numpy as np
 from paddleocr import PaddleOCR
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
+from pymongo import MongoClient
+from datetime import datetime
 
 # Set device with CUDA priority
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using device: {device}")
+
+# MongoDB Atlas connection
+MONGO_URI = "mongodb+srv://AI_agent:z8W1L0n41kZvseDw@unisys.t75li.mongodb.net/?retryWrites=true&w=majority&appName=Unisys"
+client = MongoClient(MONGO_URI)
+db = client["vehicle_detection"]  # Database name
+collection = db["detected_vehicles"]  # Collection name
 
 # Class definitions
 Modal_classes = ['MPV', 'Minivan']
@@ -31,15 +39,14 @@ def detect_vehicle_color(roi):
     """Detect dominant vehicle color using HSV histogram analysis"""
     try:
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, (0, 30, 30), (180, 255, 255))  # Remove low saturation
+        mask = cv2.inRange(hsv, (0, 30, 30), (180, 255, 255))
         
-        # Calculate histogram in Hue channel
         hist = cv2.calcHist([hsv], [0], mask, [180], [0, 180])
         dominant_hue = np.argmax(hist)
         
         color_scores = {}
         for color, ranges in COLOR_RANGES.items():
-            if len(ranges) == 4:  # Handle red's dual range
+            if len(ranges) == 4:
                 lower1, upper1, lower2, upper2 = ranges
                 mask1 = cv2.inRange(hsv, np.array(lower1), np.array(upper1))
                 mask2 = cv2.inRange(hsv, np.array(lower2), np.array(upper2))
@@ -81,23 +88,34 @@ def validate_roi(roi):
     """Check if ROI is valid and non-empty"""
     return roi is not None and roi.size > 0 and roi.shape[0] > 10 and roi.shape[1] > 10
 
+def save_to_mongodb(track_id, data):
+    """Save vehicle data to MongoDB with upsert operation"""
+    try:
+        collection.update_one(
+            {"track_id": track_id},
+            {"$set": {
+                **data,
+                "last_updated": datetime.now()
+            }},
+            upsert=True
+        )
+    except Exception as e:
+        print(f"Database error: {e}")
+
 def process_video(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video {video_path}")
         return
 
-    # Video properties
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     
-    # Video writer setup
     output_path = video_path.replace(".mp4", "_tracked.mp4")
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
-    # Window setup
     cv2.namedWindow('Vehicle Tracking', cv2.WINDOW_NORMAL)
     cv2.resizeWindow('Vehicle Tracking', 960, 540)
 
@@ -107,7 +125,7 @@ def process_video(video_path):
             break
 
         # Vehicle detection with CUDA
-        vehicle_results = vehicle_model.predict(frame, conf=0.7, verbose=False, device=device)
+        vehicle_results = vehicle_model.predict(frame, conf=0.6, verbose=False, device=device)
         
         # Prepare detections for DeepSORT
         detections = []
@@ -147,8 +165,12 @@ def process_video(video_path):
                     'color': "Unknown",
                     'color_confidence': 0.0,
                     'plate_confidence': 0.0,
-                    'plate_text': "Not detected"
+                    'plate_text': "Not detected",
+                    'first_seen': datetime.now(),
+                    'last_seen': datetime.now()
                 }
+            else:
+                vehicle_info[track_id]['last_seen'] = datetime.now()
 
             info = vehicle_info[track_id]
             
@@ -190,7 +212,7 @@ def process_video(video_path):
 
                 # Number plate detection
                 try:
-                    plate_results = number_plate_model.predict(vehicle_roi, conf=0.5, verbose=False, device=device)
+                    plate_results = number_plate_model.predict(vehicle_roi, conf=0.4, verbose=False, device=device)
                     for plate in plate_results:
                         for pbox, pcls, pconf in zip(plate.boxes.xyxy.cpu().numpy(),
                                                    plate.boxes.cls.cpu().numpy().astype(int),
@@ -215,6 +237,34 @@ def process_video(video_path):
                 except Exception as e:
                     print(f"Plate processing error: {e}")
 
+                # Prepare data for MongoDB
+                db_data = {
+                    "track_id": track_id,
+                    "vehicle_type": info['vehicle_class'],
+                    "modal_type": info['modal_class'],
+                    "color": info['color'],
+                    "license_plate": info['plate_text'],
+                    "confidence_scores": {
+                        "vehicle": info['vehicle_confidence'],
+                        "modal": info['modal_confidence'],
+                        "color": info['color_confidence'],
+                        "plate": info['plate_confidence']
+                    },
+                    "bounding_box": {
+                        "x1": x1,
+                        "y1": y1,
+                        "x2": x2,
+                        "y2": y2
+                    },
+                    "timestamps": {
+                        "first_seen": info['first_seen'],
+                        "last_seen": info['last_seen']
+                    }
+                }
+                
+                # Save to MongoDB
+                save_to_mongodb(track_id, db_data)
+
         # Write and display frame
         out.write(frame)
         cv2.imshow('Vehicle Tracking', frame)
@@ -222,12 +272,21 @@ def process_video(video_path):
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # Release resources
+    # Final summary and bulk insert
+    try:
+        collection.insert_many([{
+            **vehicle,
+            "track_id": track_id,
+            "final_update": datetime.now()
+        } for track_id, vehicle in vehicle_info.items()])
+    except Exception as e:
+        print(f"Final database insert error: {e}")
+
     cap.release()
     out.release()
     cv2.destroyAllWindows()
     
-    # Final summary
+    # Print final summary
     print("\nVehicle Tracking Summary:")
     for tid, data in vehicle_info.items():
         print(f"ID {tid}:")
