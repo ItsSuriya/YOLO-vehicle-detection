@@ -1,0 +1,186 @@
+import cv2
+import torch
+import numpy as np
+from paddleocr import PaddleOCR
+from ultralytics import YOLO
+
+# Set device with CUDA priority
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
+
+# Class definitions
+Modal_classes = ['MPV', 'Minivan']
+Vehicle_classes = ['Bus', 'Car', 'Two wheeler']
+Number_plate_classes = ['Number Plate']
+
+# Color detection parameters
+COLOR_RANGES = {
+    'red':    ([0, 100, 100], [10, 255, 255], [160, 100, 100], [180, 255, 255]),
+    'blue':   ([100, 150, 50], [140, 255, 255]),
+    'dark blue': ([100, 100, 20], [130, 255, 100]),
+    'green':  ([40, 50, 50], [80, 255, 255]),
+    'white':  ([0, 0, 200], [180, 30, 255]),
+    'black':  ([0, 0, 0], [180, 255, 30]),
+    'yellow': ([20, 100, 100], [40, 255, 255]),
+    'silver': ([0, 0, 150], [180, 30, 210]),
+    'gray':   ([0, 0, 50], [180, 30, 150]),
+    'orange': ([10, 100, 100], [20, 255, 255]),
+}
+
+def detect_vehicle_color(roi):
+    """Detect dominant vehicle color using HSV histogram analysis"""
+    try:
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (0, 30, 30), (180, 255, 255))
+        
+        hist = cv2.calcHist([hsv], [0], mask, [180], [0, 180])
+        dominant_hue = np.argmax(hist)
+        
+        color_scores = {}
+        for color, ranges in COLOR_RANGES.items():
+            if len(ranges) == 4:
+                lower1, upper1, lower2, upper2 = ranges
+                mask1 = cv2.inRange(hsv, np.array(lower1), np.array(upper1))
+                mask2 = cv2.inRange(hsv, np.array(lower2), np.array(upper2))
+                score = (cv2.countNonZero(mask1) + cv2.countNonZero(mask2)) / (roi.size / 3)
+            else:
+                lower, upper = ranges
+                score = cv2.countNonZero(cv2.inRange(hsv, np.array(lower), np.array(upper))) / (roi.size / 3)
+            
+            color_scores[color] = score
+        
+        best_color = max(color_scores, key=color_scores.get)
+        confidence = color_scores[best_color]
+        return best_color, confidence
+    except:
+        return 'unknown', 0.0
+
+# Initialize OCR reader
+ocr_reader = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=torch.cuda.is_available())
+
+# Load models
+def load_model(path):
+    model = YOLO(path).to(device)
+    model.fuse()
+    if device == 'cuda':
+        model.half()
+    return model
+
+vehicle_model = load_model(r"E:\Unisys project\Dataset\runs\detect\Vehicle-info2\weights\best.pt")
+modal_model = load_model(r"E:\Unisys project\Dataset\NEW\runs\detect\last-info\weights\best.pt")
+number_plate_model = load_model(r"E:\Unisys project\Dataset\runs\detect\Vehicle-Number plate\weights\best.pt")
+
+def process_image(image_path):
+    # Read image
+    frame = cv2.imread(image_path)
+    if frame is None:
+        print(f"Error: Could not read image from {image_path}")
+        return
+
+    detection_summary = []
+    frame_count = 0  # For consistent output format
+
+    # Vehicle detection
+    vehicle_results = vehicle_model.predict(frame, conf=0.6, verbose=False, device=device)
+    
+    for result in vehicle_results:
+        boxes = result.boxes.xyxy.cpu().numpy()
+        classes = result.boxes.cls.cpu().numpy().astype(int)
+        confidences = result.boxes.conf.cpu().numpy()
+        
+        for box, cls, conf in zip(boxes, classes, confidences):
+            frame_count += 1
+            vehicle_info = {
+                'vehicle_class': Vehicle_classes[cls],
+                'vehicle_confidence': float(conf),
+                'modal_class': "Unknown",
+                'modal_confidence': 0.0,
+                'color': "Unknown",
+                'color_confidence': 0.0,
+                'plate_text': "Not detected",
+                'plate_confidence': 0.0
+            }
+            
+            x1, y1, x2, y2 = map(int, box)
+            
+            # Draw vehicle bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            vehicle_label = f"{vehicle_info['vehicle_class']} {vehicle_info['vehicle_confidence']:.2f}"
+            cv2.putText(frame, vehicle_label, (x1, y1-10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            
+            # Process vehicle ROI
+            vehicle_roi = frame[y1:y2, x1:x2]
+            if vehicle_roi.size == 0:
+                continue
+
+            # Color detection
+            color, color_conf = detect_vehicle_color(vehicle_roi)
+            vehicle_info['color'] = color
+            vehicle_info['color_confidence'] = color_conf
+            cv2.putText(frame, f"Color: {color} ({color_conf:.2f})", 
+                       (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+            # Modal detection
+            try:
+                modal_results = modal_model.predict(vehicle_roi, conf=0.5, verbose=False, device=device)
+                for modal in modal_results:
+                    for mbox, mcls, mconf in zip(modal.boxes.xyxy.cpu().numpy(),
+                                               modal.boxes.cls.cpu().numpy().astype(int),
+                                               modal.boxes.conf.cpu().numpy()):
+                        if mconf > vehicle_info['modal_confidence']:
+                            vehicle_info['modal_class'] = Modal_classes[int(mcls)]
+                            vehicle_info['modal_confidence'] = float(mconf)
+                            mx1, my1, mx2, my2 = map(int, mbox)
+                            cv2.rectangle(frame, (x1+mx1, y1+my1), (x1+mx2, y1+my2), (0, 255, 0), 2)
+                            modal_label = f"{vehicle_info['modal_class']} {vehicle_info['modal_confidence']:.2f}"
+                            cv2.putText(frame, modal_label, (x1+mx1, y1+my1-10), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            except Exception as e:
+                print(f"Modal detection error: {e}")
+
+            # Number plate detection
+            try:
+                plate_results = number_plate_model.predict(vehicle_roi, conf=0.4, verbose=False, device=device)
+                for plate in plate_results:
+                    for pbox, pcls, pconf in zip(plate.boxes.xyxy.cpu().numpy(),
+                                               plate.boxes.cls.cpu().numpy().astype(int),
+                                               plate.boxes.conf.cpu().numpy()):
+                        if pconf > vehicle_info['plate_confidence']:
+                            vehicle_info['plate_confidence'] = float(pconf)
+                            px1, py1, px2, py2 = map(int, pbox)
+                            cv2.rectangle(frame, (x1+px1, y1+py1), (x1+px2, y1+py2), (0, 0, 255), 2)
+                            
+                            # OCR processing
+                            plate_roi = vehicle_roi[py1:py2, px1:px2]
+                            if plate_roi.size > 0:
+                                gray_plate = cv2.cvtColor(plate_roi, cv2.COLOR_BGR2GRAY)
+                                result = ocr_reader.ocr(gray_plate, cls=True)
+                                if result and len(result[0]) > 0:
+                                    vehicle_info['plate_text'] = result[0][0][1][0]
+                                    cv2.putText(frame, f"Plate: {vehicle_info['plate_text']}", 
+                                              (x1+px1, y1+py2+40), 
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            except Exception as e:
+                print(f"Plate processing error: {e}")
+
+            detection_summary.append(vehicle_info)
+
+    for idx, vehicle in enumerate(detection_summary, 1):
+        print(f"\nVehicle {idx}:")
+        print(f"| {'Vehicle Type':<20} | {vehicle['vehicle_class']:<20} |")
+        print(f"| {'Modal Type':<20} | {vehicle['modal_class']:<20} |")
+        print(f"| {'Color':<20} | {vehicle['color']:<20} |")
+        print(f"| {'License Plate':<20} | {vehicle['plate_text']:<20} |")
+    print(f"\nTotal vehicles detected: {len(detection_summary)}")
+
+    # Display results
+    cv2.namedWindow('Detection Results', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('Detection Results', 800, 600)
+    cv2.imshow('Detection Results', frame)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+# Process image
+image_path = r"E:\Unisys project\1 Extraction\2\frame_110.jpg"
+process_image(image_path)
