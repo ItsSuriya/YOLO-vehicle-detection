@@ -26,6 +26,7 @@ Number_plate_classes = ['Number Plate']
 COLOR_RANGES = {
     'red':    ([0, 100, 100], [10, 255, 255], [160, 100, 100], [180, 255, 255]),
     'blue':   ([100, 150, 50], [140, 255, 255]),
+    'dark blue': ([100, 100, 20], [130, 255, 100]),
     'green':  ([40, 50, 50], [80, 255, 255]),
     'white':  ([0, 0, 200], [180, 30, 255]),
     'black':  ([0, 0, 0], [180, 255, 30]),
@@ -125,7 +126,7 @@ def process_video(video_path):
             break
 
         # Vehicle detection with CUDA
-        vehicle_results = vehicle_model.predict(frame, conf=0.6, verbose=False, device=device)
+        vehicle_results = vehicle_model.predict(frame, conf=0.8, verbose=False, device=device)
         
         # Prepare detections for DeepSORT
         detections = []
@@ -163,6 +164,7 @@ def process_video(video_path):
                     'modal_class': "Unknown",
                     'modal_confidence': 0.0,
                     'color': "Unknown",
+                    "company": "Unknown",
                     'color_confidence': 0.0,
                     'plate_confidence': 0.0,
                     'plate_text': "Not detected",
@@ -193,7 +195,7 @@ def process_video(video_path):
 
                 # Modal detection
                 try:
-                    modal_results = modal_model.predict(vehicle_roi, conf=0.5, verbose=False, device=device)
+                    modal_results = modal_model.predict(vehicle_roi, conf=0.7, verbose=False, device=device)
                     for modal in modal_results:
                         for mbox, mcls, mconf in zip(modal.boxes.xyxy.cpu().numpy(),
                                                    modal.boxes.cls.cpu().numpy().astype(int),
@@ -201,6 +203,14 @@ def process_video(video_path):
                             mx1, my1, mx2, my2 = map(int, mbox)
                             info['modal_class'] = Modal_classes[int(mcls)]
                             info['modal_confidence'] = float(mconf)
+
+                            if info['modal_class'] == 'Minivan':
+                                info['company'] = 'Suzuki'
+                                info['vehicle_class'] = "Car"
+                            elif info['modal_class'] == 'MPV':
+                                info['company'] = 'Renault'
+                                info['vehicle_class'] = "Car"
+                            
                             cv2.rectangle(frame, (x1+mx1, y1+my1),
                                         (x1+mx2, y1+my2), (0, 255, 0), 2)
                             modal_label = f"{info['modal_class']} {info['modal_confidence']:.2f}"
@@ -242,6 +252,7 @@ def process_video(video_path):
                     "track_id": track_id,
                     "vehicle_type": info['vehicle_class'],
                     "modal_type": info['modal_class'],
+                    "company": info['company'],
                     "color": info['color'],
                     "license_plate": info['plate_text'],
                     "confidence_scores": {
@@ -292,10 +303,11 @@ def process_video(video_path):
         print(f"ID {tid}:")
         print(f"  Vehicle: {data['vehicle_class']} ({data['vehicle_confidence']:.2f})")
         print(f"  Type: {data['modal_class']} ({data['modal_confidence']:.2f})")
+        print(f"  Company: {data['company']}")  # Add company to summary
         print(f"  Color: {data['color']} ({data['color_confidence']:.2f})")
         print(f"  Plate: {data['plate_text']} ({data['plate_confidence']:.2f})")
         print("-" * 40)
 
 # Process video
 video_path = r"C:\Users\iamsu\Downloads\Untitled video - Made with Clipchamp (4).mp4"
-process_video(video_path)
+process_video(video_path)   
