@@ -1,5 +1,7 @@
 import cv2
+import time 
 import torch
+import logging
 import numpy as np
 from paddleocr import PaddleOCR
 from ultralytics import YOLO
@@ -9,7 +11,9 @@ from datetime import datetime
 
 # Set device with CUDA priority
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"Using device: {device}")
+
+logging.getLogger("ppocr").setLevel(logging.ERROR)  # Disable PaddleOCR debug logs
+logging.getLogger("ppocr").propagate = False   
 
 # MongoDB Atlas connection
 MONGO_URI = "mongodb+srv://AI_agent:z8W1L0n41kZvseDw@unisys.t75li.mongodb.net/?retryWrites=true&w=majority&appName=Unisys"
@@ -21,6 +25,9 @@ collection = db["detected_vehicles"]  # Collection name
 Modal_classes = ['MPV', 'Minivan']
 Vehicle_classes = ['Bus', 'Car', 'Two wheeler']
 Number_plate_classes = ['Number Plate']
+
+FRAME_SKIP = 2  # Process every 3rd frame (0-based index)
+OCR_CACHE_TIME = 2  # Cache OCR results for 2 seconds
 
 # Color detection parameters
 COLOR_RANGES = {
@@ -66,6 +73,29 @@ def detect_vehicle_color(roi):
 
 # Initialize OCR reader with GPU support
 ocr_reader = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=torch.cuda.is_available())
+LAST_PLATE_TEXT = {}
+PLATE_HISTORY = {}
+
+def optimize_ocr(plate_roi, track_id):
+    global LAST_PLATE_TEXT, PLATE_HISTORY
+    
+    current_time = time.time()
+    
+    # Return cached result if available and valid
+    if track_id in LAST_PLATE_TEXT:
+        time_diff = current_time - LAST_PLATE_TEXT[track_id]
+        if time_diff < OCR_CACHE_TIME:
+            return PLATE_HISTORY[track_id]
+    
+    # Process OCR if no valid cache
+    result = ocr_reader.ocr(plate_roi, cls=True)
+    plate_text = result[0][0][1][0] if result and len(result[0]) > 0 else "Not detected"
+    
+    # Update cache
+    LAST_PLATE_TEXT[track_id] = current_time
+    PLATE_HISTORY[track_id] = plate_text
+    
+    return plate_text
 
 # Load models with CUDA optimization
 def load_model(path):
@@ -76,7 +106,7 @@ def load_model(path):
     return model
 
 vehicle_model = load_model(r"E:\Unisys project\Dataset\runs\detect\Vehicle-info2\weights\best.pt")
-modal_model = load_model(r"E:\Unisys project\Dataset\NEW\runs\detect\last-info\weights\best.pt")
+modal_model = load_model(r"E:\Unisys project\Dataset\runs\detect\last-modelinfo\weights\best.pt")
 number_plate_model = load_model(r"E:\Unisys project\Dataset\runs\detect\Vehicle-Number plate\weights\best.pt")
 
 # Initialize DeepSORT tracker
@@ -86,18 +116,28 @@ tracker = DeepSort(max_age=30, n_init=3)
 vehicle_info = {}
 
 def validate_roi(roi):
-    """Check if ROI is valid and non-empty"""
     return roi is not None and roi.size > 0 and roi.shape[0] > 10 and roi.shape[1] > 10
 
 def save_to_mongodb(track_id, data):
-    """Save vehicle data to MongoDB with upsert operation"""
     try:
+        document = {
+            "track_id": track_id,
+            "camera_number": 1, 
+            "vehicle_type": data.get("vehicle_class", "Unknown"),
+            "modal_type": data.get("modal_class", "Unknown"),
+            "company": data.get("company", "Unknown"),
+            "color": data.get("color", "Unknown"),
+            "license_plate": data.get("plate_text", "Not detected"),
+            "timestamps": {
+                "first_seen": data.get("first_seen", datetime.now()),
+                "last_seen": data.get("last_seen", datetime.now())
+            },
+            "last_updated": datetime.now()
+        }
+
         collection.update_one(
             {"track_id": track_id},
-            {"$set": {
-                **data,
-                "last_updated": datetime.now()
-            }},
+            {"$set": document},
             upsert=True
         )
     except Exception as e:
@@ -108,6 +148,8 @@ def process_video(video_path):
     if not cap.isOpened():
         print(f"Error: Could not open video {video_path}")
         return
+
+    frame_count = 0
 
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -125,6 +167,14 @@ def process_video(video_path):
         if not ret:
             break
 
+        frame_count += 1
+        if frame_count % (FRAME_SKIP + 1) != 0:
+            # Skip processing but still write the frame
+            out.write(frame)
+            cv2.imshow('Vehicle Tracking', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            continue
         # Vehicle detection with CUDA
         vehicle_results = vehicle_model.predict(frame, conf=0.8, verbose=False, device=device)
         
@@ -195,7 +245,7 @@ def process_video(video_path):
 
                 # Modal detection
                 try:
-                    modal_results = modal_model.predict(vehicle_roi, conf=0.7, verbose=False, device=device)
+                    modal_results = modal_model.predict(vehicle_roi, conf=0.5, verbose=False, device=device)
                     for modal in modal_results:
                         for mbox, mcls, mconf in zip(modal.boxes.xyxy.cpu().numpy(),
                                                    modal.boxes.cls.cpu().numpy().astype(int),
@@ -234,6 +284,7 @@ def process_video(video_path):
                             plate_roi = vehicle_roi[py1:py2, px1:px2]
                             if validate_roi(plate_roi):
                                 gray_plate = cv2.cvtColor(plate_roi, cv2.COLOR_BGR2GRAY)
+                                info['plate_text'] = optimize_ocr(gray_plate, track_id)  
                                 result = ocr_reader.ocr(gray_plate, cls=True)
                                 if result and len(result[0]) > 0:
                                     info['plate_text'] = result[0][0][1][0]
@@ -247,31 +298,15 @@ def process_video(video_path):
                 except Exception as e:
                     print(f"Plate processing error: {e}")
 
-                # Prepare data for MongoDB
                 db_data = {
-                    "track_id": track_id,
-                    "vehicle_type": info['vehicle_class'],
-                    "modal_type": info['modal_class'],
-                    "company": info['company'],
-                    "color": info['color'],
-                    "license_plate": info['plate_text'],
-                    "confidence_scores": {
-                        "vehicle": info['vehicle_confidence'],
-                        "modal": info['modal_confidence'],
-                        "color": info['color_confidence'],
-                        "plate": info['plate_confidence']
-                    },
-                    "bounding_box": {
-                        "x1": x1,
-                        "y1": y1,
-                        "x2": x2,
-                        "y2": y2
-                    },
-                    "timestamps": {
+                        "vehicle_class": info['vehicle_class'],
+                        "modal_class": info['modal_class'],
+                        "company": info['company'],
+                        "color": info['color'],
+                        "plate_text": info['plate_text'],
                         "first_seen": info['first_seen'],
                         "last_seen": info['last_seen']
                     }
-                }
                 
                 # Save to MongoDB
                 save_to_mongodb(track_id, db_data)
@@ -283,31 +318,11 @@ def process_video(video_path):
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # Final summary and bulk insert
-    try:
-        collection.insert_many([{
-            **vehicle,
-            "track_id": track_id,
-            "final_update": datetime.now()
-        } for track_id, vehicle in vehicle_info.items()])
-    except Exception as e:
-        print(f"Final database insert error: {e}")
-
     cap.release()
     out.release()
     cv2.destroyAllWindows()
     
-    # Print final summary
-    print("\nVehicle Tracking Summary:")
-    for tid, data in vehicle_info.items():
-        print(f"ID {tid}:")
-        print(f"  Vehicle: {data['vehicle_class']} ({data['vehicle_confidence']:.2f})")
-        print(f"  Type: {data['modal_class']} ({data['modal_confidence']:.2f})")
-        print(f"  Company: {data['company']}")  # Add company to summary
-        print(f"  Color: {data['color']} ({data['color_confidence']:.2f})")
-        print(f"  Plate: {data['plate_text']} ({data['plate_confidence']:.2f})")
-        print("-" * 40)
 
 # Process video
-video_path = r"C:\Users\iamsu\Downloads\Untitled video - Made with Clipchamp (4).mp4"
+video_path = r"E:\Unisys project\1\2.mp4"
 process_video(video_path)   
